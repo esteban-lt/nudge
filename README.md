@@ -28,7 +28,8 @@ Prices on Mercado Libre change often, and the same product is usually sold by se
 | Database | PostgreSQL |
 | Auth | JWT (Passport) for users · OAuth 2.0 (Authorization Code) for Mercado Libre |
 | Email | [Resend](https://resend.com/) |
-| Frontend | React · Vite |
+| Frontend | React 19 · Vite · TypeScript · Tailwind CSS · shadcn/ui · React Router · TanStack Query |
+| Hosting | Render (API as Docker Web Service, frontend as Static Site) |
 | Tooling | Bun · Vitest · Oxlint · Docker Compose |
 
 ## Project structure
@@ -77,6 +78,8 @@ The API integrates with the official [Mercado Libre API](https://developers.merc
    cd apps/app && bun install && bun run dev
    ```
 
+   It runs at http://localhost:5173 and, by default, talks to the deployed API through the Vite proxy (`/api`). To use your local API instead, create `apps/app/.env.local` with `API_PROXY_TARGET=http://localhost:3000`.
+
 Without `RESEND_API_KEY` (development only), emails are not sent: the API logs the recipient, subject and plain text instead.
 
 ## Database migrations
@@ -90,7 +93,7 @@ The schema is managed only by migrations (`apps/api/migrations`): `synchronize` 
 | `bun run migration:revert` | Reverts the last applied migration |
 | `bun run migration:show` | Lists migrations (`[X]` applied, `[ ]` pending) |
 
-To migrate production, point `DATABASE_URL` at the production database and run `bun run migration:run` before deploying the new version.
+In production the Docker image applies the pending migrations on startup. To migrate manually, point `DATABASE_URL` at the target database and run `bun run migration:run`.
 
 ## Tests
 
@@ -120,6 +123,18 @@ Set `NODE_ENV=production`. The API refuses to start if any of these is missing o
 
 `PORT` is provided by the host (Render sets it). `ADMIN_EMAILS` is optional. Sessions default to a 15-minute access token (`JWT_EXPIRES_IN`, signed with the `JWT_ISSUER` and `JWT_AUDIENCE` claims) and a 30-day refresh token (`REFRESH_TOKEN_EXPIRES_IN_DAYS`); set `REFRESH_COOKIE_SAME_SITE=none` only if the frontend is served from a different site than the API. `GET /health` is a lightweight endpoint (no database access) for uptime checks.
 
+## Deployment
+
+| Piece | Where | Notes |
+|---|---|---|
+| API | Render **Web Service** (Docker, `apps/api`) | Needs an always-on instance: the price check is a cron job inside the process, so it does not run while the service is asleep (e.g. Render's free tier spins down after 15 minutes without traffic) |
+| Frontend | Render **Static Site** | Root directory `apps/app`, build command `bun install --frozen-lockfile && bun run build`, publish directory `dist`, plus a rewrite `/*` → `/index.html` so deep links and reloads work |
+| Domains | `nudge-api.estebanlt.com` (API), `nudge.estebanlt.com` (frontend) | DNS records in Cloudflare set to *DNS only* (no proxy) so Render can verify the domain and issue the certificate |
+
+- Set `VITE_API_URL` (see `apps/app/.env.template`) to the public API URL. It is read at build time, so changing it requires a new frontend build.
+- The frontend and the API must share the same site (`estebanlt.com`): the refresh-token cookie is `SameSite=Lax`.
+- On the API, set `CORS_ORIGIN` and `FRONTEND_URL` to the frontend URL (`https://nudge.estebanlt.com`) and `API_URL` to the API URL.
+
 ## Docker
 
 The image (`apps/api/Dockerfile`) contains only the compiled API and production dependencies; no `.env` or secrets. Pass the variables listed in [Production](#production) at runtime.
@@ -132,11 +147,13 @@ docker build -t nudge-api apps/api
 docker run -d -p 3000:3000 --env-file prod.env nudge-api
 ```
 
-Migrations never run on startup. Run them with the same image before starting a new version:
+The container applies the pending migrations on every start, right before launching the API, so a new version updates the schema by itself. To run them manually with the same image:
 
 ```bash
 docker run --rm -e DATABASE_URL="postgresql://..." nudge-api node node_modules/typeorm/cli.js migration:run -d dist/config/data-source.js
 ```
+
+The frontend does not need Docker: it builds to static files (see [Deployment](#deployment)).
 
 ## API overview
 
@@ -154,7 +171,11 @@ docker run --rm -e DATABASE_URL="postgresql://..." nudge-api node node_modules/t
 | `GET` | `/mercado-libre/products/:category` | Best sellers in a category (e.g. `computers`) |
 | `GET` | `/mercado-libre/products?q=&page=` | Search the catalog |
 | `GET` · `POST` | `/tracked-products` | List / track products |
+| `GET` · `PATCH` · `DELETE` | `/tracked-products/:id` | Tracking detail / edit its threshold / stop following |
+| `PATCH` | `/tracked-products/:id/pause` · `/tracked-products/:id/resume` | Pause / resume a tracking |
+| `GET` | `/products/:productId/price-history?days=` | Price history of a product |
 | `GET` | `/alerts` · `/alerts/unread-count` | Alerts inbox |
+| `PATCH` | `/alerts/read-all` · `/alerts/:id/read` | Mark every alert / one alert as read |
 | `PATCH` | `/users/me/email-notifications` | Turn alert emails on or off |
 | `POST` | `/users/unsubscribe?token=` | Turn alert emails off from the link in an alert email (no session needed) |
 | `GET` | `/mercado-libre/auth/status` | Mercado Libre connection status (admin) |
