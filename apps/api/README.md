@@ -1,114 +1,86 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Nudge · API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+REST API built with [NestJS](https://nestjs.com/) (TypeScript, ESM) and TypeORM on PostgreSQL. It reads product data from the official Mercado Libre API, stores price history, evaluates price-drop alerts and sends emails. The project overview, setup steps, environment variables and the endpoint list live in the [root README](../../README.md); this file explains how the API is organized and how it works.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Scripts
 
-## Description
+Run them from `apps/api` with Bun.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+| Command | What it does |
+|---|---|
+| `bun run start:dev` | Start in watch mode (http://localhost:3000) |
+| `bun run build` | Compile the app and the migrations (`dist/`) |
+| `bun run start:prod` | Run the compiled app |
+| `bun run lint` | Oxlint over `src/` and `test/` |
+| `bun run test` · `bun run test:e2e` | Unit tests / integration tests against `TEST_DATABASE_URL` |
+| `bun run migration:generate migrations/Name` | Generate a migration from the entity changes |
+| `bun run migration:run` · `migration:revert` · `migration:show` | Apply / revert / list migrations |
 
-## Project setup
+Configuration is read from `.env` (copy `.env.template`, which documents every variable) and validated with Joi at startup (`src/config/env.ts`): the app refuses to boot if a required production variable is missing.
 
-```bash
-$ bun install
+## Architecture
+
+One Nest module per domain, each with its controller, service, DTOs and entities:
+
+```
+src/
+├── auth/              # register, login, email verification, sessions, password reset
+├── users/             # profile settings, email-notification opt-out and unsubscribe tokens
+├── mercado-libre/     # OAuth, HTTP client with retries and circuit breaker, catalog endpoints
+├── products/          # product entity + provider registry (Mercado Libre; Amazon is a stub)
+├── price-history/     # price snapshots per product
+├── tracked-products/  # a user following a product with a threshold
+├── price-refresh/     # scheduled job that refreshes prices
+├── alerts/            # alert detection, inbox and email dispatch
+├── mail/              # Resend client and email helpers
+├── health/            # GET /health
+└── config/            # env validation, TypeORM data source, rate limits
 ```
 
-## Compile and run the project
+Global setup (`src/app.setup.ts`) is shared by `main.ts` and the e2e tests, so tests exercise the app as it really runs: Helmet, CORS with credentials for the origins in `CORS_ORIGIN`, `cookie-parser`, and a global `ValidationPipe` (`whitelist` and `forbidNonWhitelisted`, so unknown fields are rejected). `trust proxy` is on because Render sits in front, which keeps per-client rate limiting correct. Rate limiting uses `@nestjs/throttler`: 100 requests per minute by default and 5 per minute on sensitive auth endpoints.
 
-```bash
-# development
-$ bun run start
+## How it works
 
-# watch mode
-$ bun run start:dev
+### Authentication and sessions
 
-# production mode
-$ bun run start:prod
-```
+- Passwords are hashed with bcrypt. Registration sends a 6-digit code by email; the account cannot get a session until it is verified. Between registration and verification the client holds a short-lived `verificationToken` that only works on the two verification endpoints.
+- Login returns a 15-minute JWT access token in the body (signed with issuer and audience claims, validated by Passport) and sets a **refresh token as an HttpOnly cookie** scoped to `/auth`. Only a SHA-256 hash of the refresh token is stored, in the `sessions` table.
+- Refreshing **rotates** the token. Reusing an already revoked token revokes the whole token family of that user's session. The JWT carries the user id and the session id, and the guard checks the session on every request, so logout or revocation takes effect immediately instead of waiting for the token to expire.
+- `REFRESH_COOKIE_SAME_SITE` defaults to `lax`, which requires the frontend and the API to share the same site (for example `nudge.example.com` and `nudge-api.example.com`).
 
-## Run tests
+### Mercado Libre integration
 
-```bash
-# unit tests
-$ bun run test
+The account is linked once through OAuth 2.0 (Authorization Code, admins only) and the access token is renewed automatically afterwards. The HTTP layer adds, per request: a timeout, up to two retries for reads on network errors, `5xx` and `429` (exponential backoff with jitter, honoring `Retry-After`), and a circuit breaker that stops calling Mercado Libre for 30 seconds after 5 consecutive failures (the API answers `503`). Catalog results are filtered to products that have active sellers, and the lowest price across sellers is what gets stored.
 
-# e2e tests
-$ bun run test:e2e
+`products/providers` defines a provider interface and a registry, so another store can be added without touching the tracking or alert logic.
 
-# test coverage
-$ bun run test:cov
-```
+### Price refresh
 
-## Deployment
+`PriceRefreshScheduler` registers a `cron` job when the app starts (`PRICE_REFRESH_CRON`, `PRICE_REFRESH_TIMEZONE`). Each run:
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+1. Loads the tracked products that need a refresh (those with a recent snapshot are skipped).
+2. Fetches their current price with bounded concurrency and stores a row in `price_history`.
+3. Runs alert detection for each new snapshot.
+4. Dispatches pending alert emails.
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+A run is skipped if the previous one is still in progress. The job lives **inside the Node process**, so it only fires while the API is awake: host it on an always-on instance. A product that Mercado Libre reports as unavailable, or a failure on a single product, never stops the rest of the run.
 
-```bash
-$ bun install -g @nestjs/mau
-$ mau deploy
-```
+### Alerts
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+A tracking has a threshold of type `price_below` (absolute price) or `percentage_drop`. `AlertDetectionService` creates one alert when a new snapshot crosses the threshold of an active tracking. Alerts appear in the in-app inbox, and `AlertDispatchService` emails them right after each refresh, with a single retry 10 minutes later for any still pending. Emails include a one-click unsubscribe (`List-Unsubscribe` and `List-Unsubscribe-Post`, RFC 8058) backed by a signed token, so no session is needed.
 
-## Observability
+### Email
 
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
+`MailService` wraps [Resend](https://resend.com/). In development without `RESEND_API_KEY` it logs the recipient, subject and plain text instead of sending. The links in emails are built from `FRONTEND_URL` (reset password, unsubscribe) and `API_URL` (unsubscribe header).
 
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
+## Database and migrations
 
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
+The schema is managed only by migrations in `migrations/`; `synchronize` is off everywhere. The Docker image runs `migration:run` right before starting the API, so deploying a new version updates the schema.
 
-## Resources
+## Tests
 
-Check out a few resources that may come in handy when working with NestJS:
+Tests mirror `src` under `test/`. Unit tests (`*.spec.ts`) need no database. Integration tests (`*.e2e-spec.ts`) apply the migrations to `TEST_DATABASE_URL` and wipe it before each test, and refuse to run against `DATABASE_URL`. Mercado Libre and Resend are always replaced by test doubles, so no credentials or real emails are involved. `test/no-secrets.e2e-spec.ts` checks that responses do not leak sensitive fields.
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observer](https://observer.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+## Docker
 
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+`Dockerfile` is a multi-stage build: dependencies and compilation with Bun on a Node 22 Alpine base, a separate production-only `node_modules` stage, and a final image that runs as the unprivileged `node` user with a `/health` healthcheck. It contains no `.env` or secrets. See the root README for run commands and the environment variables to pass.
