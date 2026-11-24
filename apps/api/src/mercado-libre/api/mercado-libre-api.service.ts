@@ -3,7 +3,7 @@ import { firstValueFrom } from 'rxjs';
 import { HttpStatus, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { MercadoLibreAuthService } from '../auth/mercado-libre-auth.service.js';
-import { MercadoLibreCircuitBreaker } from '../mercado-libre-circuit-breaker.js';
+import { MercadoLibreCircuitBreaker, MercadoLibreUnavailableException } from '../mercado-libre-circuit-breaker.js';
 import { isServiceFailure, retryDelayMs } from '../mercado-libre-retry-policy.js';
 import {
   describeMercadoLibreError,
@@ -16,6 +16,7 @@ const API_URL = 'https://api.mercadolibre.com';
 const SITE_ID = 'MLM';
 const PRODUCT_URL = 'https://www.mercadolibre.com.mx/p';
 const MAX_CONCURRENCY = 10;
+const RESTRICTED_ITEMS_STATUSES = new Set<number>([HttpStatus.FORBIDDEN, HttpStatus.GONE]);
 export const SEARCH_BATCH_SIZE = 50;
 export const SEARCH_MAX_PAGES = 3;
 
@@ -168,7 +169,10 @@ export class MercadoLibreApiService {
 
   private async getProductItems(product: CatalogProduct): Promise<ProductItem[]> {
     try {
-      const { results } = await this.request<{ results: ProductItem[] }>(`/products/${product.id}/items`);
+      const { results } = await this.request<{ results: ProductItem[] }>(
+        `/products/${product.id}/items`,
+        RESTRICTED_ITEMS_STATUSES,
+      );
       return results;
     } catch (error) {
       if (!(error instanceof MercadoLibreRequestError)) throw error;
@@ -177,9 +181,17 @@ export class MercadoLibreApiService {
       if (status === HttpStatus.NOT_FOUND) return [];
 
       // Mercado Libre restringe /items en algunos productos; buy_box_winner trae al menos la oferta ganadora.
-      if (status === HttpStatus.FORBIDDEN || status === HttpStatus.GONE) {
-        this.logger.warn(`/products/${product.id}/items respondió ${status}; se usa buy_box_winner`);
-        return product.buy_box_winner ? [product.buy_box_winner] : [];
+      if (status !== undefined && RESTRICTED_ITEMS_STATUSES.has(status)) {
+        if (product.buy_box_winner) {
+          this.logger.warn(`/products/${product.id}/items respondió ${status}; se usa buy_box_winner`);
+          return [product.buy_box_winner];
+        }
+        // Un 403 sin buy_box_winner no dice si el producto tiene vendedores: es un bloqueo, no falta de ofertas.
+        if (status === HttpStatus.FORBIDDEN) {
+          this.logger.warn(`/products/${product.id}/items respondió 403 y no hay buy_box_winner; no se pueden leer las ofertas`);
+          throw new MercadoLibreUnavailableException();
+        }
+        return [];
       }
       throw toClientException(error);
     }
@@ -193,7 +205,8 @@ export class MercadoLibreApiService {
     }
   }
 
-  private async request<T>(path: string): Promise<T> {
+  // Los códigos de expectedStatuses los maneja quien llama, así que no se registran como error.
+  private async request<T>(path: string, expectedStatuses: ReadonlySet<number> = new Set()): Promise<T> {
     let retries = 0;
     let tokenRenewed = false;
 
@@ -227,9 +240,8 @@ export class MercadoLibreApiService {
         }
 
         if (isServiceFailure(detail)) this.circuitBreaker.recordFailure();
-        if (detail.status !== HttpStatus.NOT_FOUND) {
-          this.logger.error(formatMercadoLibreError('GET', path, detail));
-        }
+        const expected = detail.status === HttpStatus.NOT_FOUND || (detail.status !== undefined && expectedStatuses.has(detail.status));
+        if (!expected) this.logger.error(formatMercadoLibreError('GET', path, detail));
         throw new MercadoLibreRequestError(detail.status);
       }
     }
