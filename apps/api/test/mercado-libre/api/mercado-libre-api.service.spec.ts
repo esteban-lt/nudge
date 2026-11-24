@@ -1,5 +1,5 @@
 import { Observable, of, throwError } from 'rxjs';
-import { BadGatewayException, NotFoundException } from '@nestjs/common';
+import { BadGatewayException, Logger, NotFoundException } from '@nestjs/common';
 
 import {
   MercadoLibreCircuitBreaker,
@@ -180,13 +180,36 @@ describe('MercadoLibreApiService (HTTP simulado)', () => {
       expect(await service.getProduct('MLM1')).toMatchObject({ price: 777, itemId: 'BUYBOX', sellersCount: 1 });
     });
 
-    it('sin buy_box_winner el producto se considera sin ofertas (404)', async () => {
+    it('un 403 sin buy_box_winner es un bloqueo de Mercado Libre (503), no un producto sin ofertas', async () => {
       const { service } = setup({
         '/products/MLM1': catalogProduct('MLM1'),
         '/products/MLM1/items': { httpError: 403 },
       });
 
+      await expect(service.getProduct('MLM1')).rejects.toThrow(MercadoLibreUnavailableException);
+    });
+
+    it('un 410 sin buy_box_winner deja el producto sin ofertas (404)', async () => {
+      const { service } = setup({
+        '/products/MLM1': catalogProduct('MLM1'),
+        '/products/MLM1/items': { httpError: 410 },
+      });
+
       await expect(service.getProduct('MLM1')).rejects.toThrow(NotFoundException);
+    });
+
+    it('un 403 de /items no se registra como error, solo como aviso', async () => {
+      const error = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const { service } = setup({
+        '/products/MLM1': catalogProduct('MLM1', { buy_box_winner: item(777, 'BUYBOX') }),
+        '/products/MLM1/items': { httpError: 403 },
+      });
+
+      await service.getProduct('MLM1');
+
+      expect(error).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledTimes(1);
     });
   });
 
