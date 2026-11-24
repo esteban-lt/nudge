@@ -1,29 +1,21 @@
 import { Link } from 'react-router'
-import { SearchX } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { useAuth } from '@/features/auth/auth-context'
+import { cn } from '@/lib/utils'
 
-/** S1 · Página no encontrada */
-export function NotFoundPage() {
-  const { status } = useAuth()
-  const authed = status === 'authenticated'
+export function NotFoundPage({ fullScreen = false }: { fullScreen?: boolean }) {
   return (
-    <div className="mx-auto flex max-w-md flex-col items-center gap-4 px-4 py-24 text-center">
-      <span className="flex size-16 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
-        <SearchX aria-hidden="true" className="size-8" />
-      </span>
-      <h1 className="m-0 font-display text-3xl font-bold">No encontramos esta página.</h1>
-      <p className="m-0 text-muted-foreground">Puede que el enlace esté roto o que la página ya no exista.</p>
-      <div className="flex flex-wrap justify-center gap-2.5">
-        <Button asChild variant={authed ? 'outline' : 'default'}>
-          <Link to="/">Ir al inicio</Link>
-        </Button>
-        {authed && (
-          <Button asChild>
-            <Link to="/seguimientos">Mis seguimientos</Link>
-          </Button>
-        )}
+    <div
+      className={cn(
+        'flex flex-col items-center justify-center gap-6 px-4 text-center',
+        fullScreen ? 'min-h-svh bg-background text-foreground' : 'min-h-[60svh]',
+      )}
+    >
+      <div className="flex items-center">
+        <h1 className="m-0 border-r border-border pr-6 mr-6 text-2xl font-medium leading-[49px]">404</h1>
+        <p className="m-0 text-sm leading-[49px]">Esta página no existe.</p>
       </div>
+      <Link to="/" className="text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">
+        Volver al inicio
+      </Link>
     </div>
   )
 }

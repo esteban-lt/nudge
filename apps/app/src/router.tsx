@@ -62,8 +62,10 @@ export const router = createBrowserRouter([
           { path: '/admin/mercado-libre', element: <AdminMercadoLibrePage /> },
         ],
       },
-
-      { path: '*', element: <NotFoundPage /> },
     ],
+  },
+  { 
+    path: '*', 
+    element: <NotFoundPage fullScreen /> 
   },
 ])
